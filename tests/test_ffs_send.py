@@ -122,11 +122,13 @@ def test_a_blocking_send_waits_for_room_then_drops_the_gadget(sender):
     t.send(P.Msg.PING, 4)
 
 
-@pytest.mark.parametrize('result, why', [(lambda n: -errno.EPIPE, 'Broken pipe'),
-                                         (lambda n: n - 1024, '7168 of 8192 bytes')])
-def test_a_write_the_host_did_not_complete_fails_the_next_send(sender, result, why):
+@pytest.mark.parametrize('result, short', [(lambda n: -errno.EPIPE, False),
+                                          (lambda n: n - 1024, True)])
+def test_a_write_the_host_did_not_complete_fails_the_next_send(sender, result, short):
   t, aio = sender
   aio.result = result
+  # the short write's own words, from the chunk size (write_chunk, a constant)
+  why = f'{t.write_chunk - 1024} of {t.write_chunk} bytes' if short else 'Broken pipe'
   t.send(P.Msg.PING, 1)
   with pytest.raises(LinkError, match=f'gadget write failed: {why}'):
     t.send(P.Msg.PING, 2)

@@ -39,7 +39,17 @@ PACKET_MULTIPLE = 512
 # The gadget pads every message to a burst so it never ends on a short packet:
 # dwc3 flushed its TX FIFO past one about once in 400 frames, and the host read
 # those bytes as the next header. Host to device keeps the PADDED byte instead.
-GADGET_TX_ALIGN = 16 * 1024
+#
+# The host reads in bursts of exactly this size (ReadRing.slotSize), because a
+# read must end at a message's end or inside it, never straddling one; the
+# comma writes in halves of it (FfsTransport.write_chunk). So this is also how
+# many transfers and completions one message costs, and a 393 KB inference
+# request costs 25 at 16 KB. 64 KB costs 7 for the same bytes, which is the
+# point: the per-request scheduling is a large part of a frame's round trip on
+# a host that runs other things. Constraints: a multiple of PACKET_MULTIPLE,
+# and a host's usbfs may cap a single bulk URB (Linux accepts 16 KB on a
+# high-speed link), so a Linux host needs this to be its cap or below.
+GADGET_TX_ALIGN = 64 * 1024
 
 # The comma's gadget as a USB host finds it: these IDs (pid.codes' test
 # allocation; get a real PID before distributing this), which

@@ -47,9 +47,25 @@ final class ReadRing: @unchecked Sendable {
     case idle, posted, done
   }
 
-  static let slotSize = Wire.gadgetTxAlign
-  /// 512 KB: a whole 400 KB inference request streams without the reader
-  /// posting anything, with slots to spare.
+  /// The largest read this host posts, and it must divide `gadgetTxAlign`:
+  /// the comma pads every message to a burst of that size, so a message ends
+  /// on that grid and a read of a fraction of it still ends inside one
+  /// message or at its end, never past it. Equality is not required, only
+  /// divisibility.
+  ///
+  /// Where the host takes a whole burst, it posts one: 7 completions for a
+  /// 393 KB inference request, where 16 KB is 25, and per-request overhead is
+  /// a real part of a frame's round trip. Linux's usbfs refuses a bulk URB
+  /// over 16 KB, so a Linux host (a Jetson) keeps that, four reads a burst.
+  static let slotSize: Int = {
+    #if os(Linux)
+    16 * 1024
+    #else
+    min(Wire.gadgetTxAlign, 64 * 1024)
+    #endif
+  }()
+  /// Enough for a whole 400 KB inference request plus the reads in flight
+  /// around it: 4 MB at a Mac's 64 KB reads, 512 KB at a Linux host's 16 KB.
   static let depth = 32
 
   let lock: NSCondition

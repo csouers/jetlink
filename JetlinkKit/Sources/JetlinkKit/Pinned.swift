@@ -17,7 +17,7 @@ public enum Pinned {
   /// jetlink.protocol.PACKET_MULTIPLE
   public static let packetMultiple: Int = 512
   /// jetlink.protocol.GADGET_TX_ALIGN
-  public static let gadgetTxAlign: Int = 16384
+  public static let gadgetTxAlign: Int = 65536
   /// jetlink.protocol.INFER_REQ_SIZE
   public static let inferReqSize: Int = 8
   /// jetlink.protocol.INFER_RESP_SIZE
