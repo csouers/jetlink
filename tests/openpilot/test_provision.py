@@ -410,6 +410,9 @@ class TestTheRun(OpenpilotTest):
 
   def test_no_jetson_is_left_for_the_next_run(self):
     d = self.worker()
+    # the model is not this test's business, and needs_download real here
+    # reached fetch_model, a live download, before it proved anything
+    self.patch(d, 'needs_download', mock.Mock(return_value=False))
     gadget.wait_for_host.return_value = False
     assert d.run() is False
     d.provision.assert_not_called()
