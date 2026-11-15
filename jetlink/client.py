@@ -84,6 +84,10 @@ class Reply(NamedTuple):
 # frames whose own answer is kept for a held frame's log; a frame's line is
 # written within a frame or two of the hold, so this is slack, not history
 REPLIES_KEPT = 64
+# frames a hold gave up on, kept until the session ends: a frame the server
+# never answered has no reply to read, and without this it leaves with the
+# in-flight queue at a hello and says nothing at all
+ABANDONED_KEPT = 32
 
 
 class EngineMissing(LinkError):
@@ -129,6 +133,11 @@ class JetlinkClient:
     # frames sent and not yet answered, oldest first. More than one after a
     # reply a frame gave up on (infer_end with hold)
     self._in_flight: deque[Sent] = deque()
+    # frames the hold gave up on and no reply has been read for, by seq, for
+    # the log at a session end (infer_end, hello): the reply read later takes
+    # one out again (_answered_abandoned)
+    self._abandoned: dict[int, Sent] = {}
+    self._abandoned_order: deque[int] = deque()
     # seqs sent with no reply wanted (leave): an ERROR to one is not this link's
     self._no_reply_wanted: set[int] = set()
     # frames the server never answered this session, for the log: a lost
@@ -268,7 +277,10 @@ class JetlinkClient:
       # TCP), and only this end always knows. See Transport.link_info.
       client['link'] = link
     # a new session: frames of the old one still unanswered will not be, and
-    # its last output is nothing the new model may publish
+    # its last output is nothing the new model may publish. A held frame that
+    # never got its answer is said here, or nowhere: modeld may have handed
+    # back already, and its model state went with the hand-back
+    self._report_abandoned()
     self._in_flight.clear()
     self.last_output = None
     self.frames_lost = 0
@@ -503,6 +515,7 @@ class JetlinkClient:
       msg = self._expect(P.Msg.INFER_RESP, seq, hold)
     except LinkTimeout as e:
       if not failing:
+        self._abandon(sent)
         return None
       self.dead = True
       raise LinkError(f"no answer for frame in {self.deadline:.1f}s; link abandoned") from e
@@ -531,6 +544,44 @@ class JetlinkClient:
       else:
         self._dispatch(msg)
     return answered
+
+  def _abandon(self, sent: Sent) -> None:
+    """The hold gave up on this frame and its reply is still out. Kept so a
+    session that ends without answering it can say so, rather than the frame
+    leaving quietly with the in-flight queue."""
+    if sent.seq in self._abandoned:
+      return
+    self._abandoned[sent.seq] = sent
+    self._abandoned_order.append(sent.seq)
+    while len(self._abandoned_order) > ABANDONED_KEPT:
+      self._abandoned.pop(self._abandoned_order.popleft(), None)
+
+  def _answered_abandoned(self, seq: int) -> None:
+    """A reply for a frame a hold gave up on: the reply is read like any
+    other (a frame still in flight is matched by seq), so it is not one to
+    report as never answered."""
+    if self._abandoned.pop(seq, None) is not None:
+      try:
+        self._abandoned_order.remove(seq)
+      except ValueError:
+        pass
+
+  def _report_abandoned(self) -> None:
+    """The held frames the session is about to drop. This is the case a held
+    frame's own log cannot cover: the server stalled past several holds, no
+    reply was read at all, modeld handed back and rejoined, and the frames
+    left with hello. Saying how long they were out separates a host that was
+    past the frame budget from a link that lost them."""
+    if not self._abandoned:
+      return
+    now = time.monotonic()
+    frames = sorted(sent.frame_id for sent in self._abandoned.values())
+    out_ms = [(now - sent.sent_at) * 1e3 for sent in self._abandoned.values()]
+    log.warning('jetlink: %d held frame(s) never answered before the session ended: '
+                'frames %d-%d, out %d-%d ms', len(frames), frames[0], frames[-1],
+                round(min(out_ms)), round(max(out_ms)))
+    self._abandoned.clear()
+    self._abandoned_order.clear()
 
   def _keep_reply(self, reply: Reply) -> None:
     """The frame's own answer, for the log of a frame that was held before it
@@ -575,6 +626,7 @@ class JetlinkClient:
       self.dead = True
       raise LinkError(f'inference response seq {msg.seq} answers no frame sent')
     _, frame_id, flags, sent_at = self._in_flight.popleft()
+    self._answered_abandoned(msg.seq)
     if msg.payload.nbytes < P.INFER_RESP_SIZE:
       self.dead = True
       raise LinkError('inference response is missing its header')

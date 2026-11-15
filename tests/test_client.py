@@ -207,6 +207,38 @@ class FramesInFlight(SocketPairTest):
       self.assertEqual(self.client.waiting_for(), 0.0)
       self.assertEqual(self.client.last_output[0], 1.0, 'a held frame publishes the last good one')
 
+  def test_a_held_frame_never_answered_says_so_when_the_session_ends(self):
+    # the case a held frame's own line cannot cover: no reply was read at all,
+    # modeld handed back, and the frame left with the in-flight queue
+    self.send(1)
+    msg = self.peer.recv(timeout=2.0)   # the frame, never answered
+    self.assertIsNone(self.client.infer_end(msg.seq, hold=0.01))
+
+    def serve():
+      hello = self.peer.recv(timeout=2.0)
+      self.assertEqual(hello.msg_type, P.Msg.HELLO_REQ)
+      self.peer.send_json(P.Msg.HELLO_RESP, hello.seq, {'device': 'test'})
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    with self.assertLogs('jetlink.client', level='WARNING') as logs:
+      self.client.hello(timeout=2.0)
+    t.join(2.0)
+    self.assertTrue(any('1 held frame(s) never answered' in line for line in logs.output), logs.output)
+    self.assertEqual(self.client._abandoned, {}, 'said once')
+
+  def test_a_held_frame_answered_late_is_not_reported_as_unanswered(self):
+    seq = self.send(1)
+    request = self.peer.recv(timeout=2.0)
+    self.assertIsNone(self.client.infer_end(seq, hold=0.01))
+    frame_id = P.unpack_infer_req(request.payload)[0]
+    self.peer.send(P.Msg.INFER_RESP, request.seq,
+                   (reply(np.ones(self.client.spec.reply_nelem), frame_id=frame_id),))
+    seq2 = self.send(2)
+    self.answer()
+    self.client.infer_end(seq2)
+    self.assertEqual(self.client._abandoned, {})
+    self.assertIsNotNone(self.client.reply_for(frame_id), 'and its timings are still kept')
+
   def test_a_hello_forgets_the_frames_of_the_session_before(self):
     self.send(1)
 
