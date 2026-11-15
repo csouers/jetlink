@@ -196,6 +196,10 @@ class JetlinkModelState:
     self.behind: str | None = None
     # whether the last frame published the one before it: the runtime record's
     self.held = False
+    # a frame given up on, and when: its own reply was not back when its log
+    # line was written, so _note_late_reply reports what it was answered with
+    self._held_frame: int | None = None
+    self._held_gave_up = 0.0
 
   def slice_outputs(self, model_outputs: np.ndarray, output_slices: dict[str, slice]) -> dict[str, np.ndarray]:
     return {k: model_outputs[np.newaxis, v] for k, v in output_slices.items()}
@@ -287,6 +291,8 @@ class JetlinkModelState:
     t4 = time.perf_counter()
     held = self.held = model_output is None
     self.behind = self._note_hold(held)
+    if held:
+      self._held_frame, self._held_gave_up = self._frame_id, t4
     self.trips.record(t4 - frame.t0, self.client.last_timings[2])
     outputs = self._outputs(self.client.last_output if held else model_output)
     # a frame past the budget is a dropped camera frame; send against reply
@@ -301,20 +307,47 @@ class JetlinkModelState:
       # persisted on the comma so a drive can separate server execution from
       # receive stalls once the Jetson is offline; server total excludes USB
       gpu_us, queue_us, total_us = self.client.last_timings
+      # a held frame has no answer yet: last_timings there is whatever reply
+      # was read last, not this frame's, and _note_late_reply says what this
+      # one was answered with once it lands
+      server = ('; its reply is not back yet' if held
+                else f'; server gpu {gpu_us / 1e3:.1f} queue {queue_us / 1e3:.1f} total {total_us / 1e3:.1f} ms')
       receive = getattr(self.client.t, 'last_receive', {})
       # over the cable: how frames go, how many never came back, and what the
       # kernel dropped on the way in (softnet), since the link came up
       drops = getattr(self.client.t, 'net_drops', lambda: None)()
       cable = (f"; frames {'as datagrams' if self.client.t.datagrams else 'on the stream'}, "
                f"{self.client.frames_lost} lost, net drops {drops}" if drops is not None else '')
-      self._log.warning("jetlink: frame %d warp %.1f data %.1f send %.1f wait %.1f ms%s; "
-                        "server gpu %.1f queue %.1f total %.1f ms; ffs maxima prepare %.1f read_wait %.1f handoff %.1f ms%s",
+      self._log.warning("jetlink: frame %d warp %.1f data %.1f send %.1f wait %.1f ms%s%s; "
+                        "ffs maxima prepare %.1f read_wait %.1f handoff %.1f ms%s",
                         self._frame_id, (frame.t1 - frame.t0) * 1e3, (frame.t2 - frame.t1) * 1e3,
                         (frame.sent - frame.t2) * 1e3, (t4 - waiting_from) * 1e3,
-                        note,
-                        gpu_us / 1e3, queue_us / 1e3, total_us / 1e3, receive.get('prepare', 0.0) * 1e3,
+                        note, server,
+                        receive.get('prepare', 0.0) * 1e3,
                         receive.get('read_wait', 0.0) * 1e3, receive.get('handoff', 0.0) * 1e3, cable)
+    self._note_late_reply()
     return outputs
+
+  def _note_late_reply(self) -> None:
+    """The held frame's own answer, once it lands.
+
+    A hold gives up at HOLD_FRAME, so the frame's reply is read by whatever
+    reads next. How long after the give-up it came decides what the fix is:
+    a reply that lands a few ms late carried a server total inside the frame
+    budget, which is bytes or a wakeup between the two clocks and not a host
+    that cannot keep up; one that lands tens of ms late is the host.
+    """
+    if self._held_frame is None:
+      return
+    reply = getattr(self.client, 'reply_for', lambda _fid: None)(self._held_frame)
+    if reply is None:
+      return
+    held, late_ms = self._held_frame, (reply.landed_at - self._held_gave_up) * 1e3
+    self._held_frame = None
+    self._log.warning("jetlink: held frame %d was answered %.1f ms after the hold gave up: "
+                      "server gpu %.1f queue %.1f total %.1f ms, %.1f ms after its send",
+                      held, late_ms, reply.gpu_us / 1e3, reply.queue_us / 1e3, reply.total_us / 1e3,
+                      (reply.landed_at - reply.sent_at) * 1e3)
 
   def run(self, bufs: dict, transforms: dict[str, np.ndarray],
           inputs: dict[str, np.ndarray], after_enqueue: Callable[[], None] | None = None) -> dict[str, np.ndarray]:

@@ -66,6 +66,26 @@ class Sent(NamedTuple):
   sent_at: float
 
 
+class Reply(NamedTuple):
+  """A frame's own answer, kept after it lands.
+
+  A frame held past HOLD_FRAME has no reply when its log line is written, so
+  `last_timings` there is whatever reply was read last, not that frame's. This
+  is what the frame itself was answered with, and when: a reply back moments
+  after the hold gave up on it is late bytes, a slow one is the host."""
+  frame_id: int
+  gpu_us: int
+  queue_us: int
+  total_us: int
+  sent_at: float
+  landed_at: float
+
+
+# frames whose own answer is kept for a held frame's log; a frame's line is
+# written within a frame or two of the hold, so this is slack, not history
+REPLIES_KEPT = 64
+
+
 class EngineMissing(LinkError):
   """The server has no engine and this caller has no ONNX to upload.
 
@@ -102,6 +122,10 @@ class JetlinkClient:
     # the newest model output read off the link, whichever call read it: what
     # a frame whose own reply is late publishes again (JetlinkModelState.end)
     self.last_output: np.ndarray | None = None
+    # the last REPLIES_KEPT frames' own answers by frame_id, oldest first: a
+    # held frame's reply lands after its log line was written (_take_reply)
+    self.replies: dict[int, Reply] = {}
+    self._replies_order: deque[int] = deque()
     # frames sent and not yet answered, oldest first. More than one after a
     # reply a frame gave up on (infer_end with hold)
     self._in_flight: deque[Sent] = deque()
@@ -508,6 +532,22 @@ class JetlinkClient:
         self._dispatch(msg)
     return answered
 
+  def _keep_reply(self, reply: Reply) -> None:
+    """The frame's own answer, for the log of a frame that was held before it
+    landed. Bounded: a held frame's line is written within a frame or two. A
+    frame id a modeld restart reused takes the newer answer, never the old."""
+    if reply.frame_id in self.replies:
+      self._replies_order.remove(reply.frame_id)
+    self.replies[reply.frame_id] = reply
+    self._replies_order.append(reply.frame_id)
+    while len(self._replies_order) > REPLIES_KEPT:
+      self.replies.pop(self._replies_order.popleft(), None)
+
+  def reply_for(self, frame_id: int) -> Reply | None:
+    """That frame's own answer, if it has landed: None while it is still out.
+    A held frame's log asks (JetlinkModelState._note_late_reply)."""
+    return self.replies.get(frame_id)
+
   @property
   def unanswered(self) -> int:
     """Frames sent and not yet answered."""
@@ -534,12 +574,13 @@ class JetlinkClient:
     if not self._in_flight:
       self.dead = True
       raise LinkError(f'inference response seq {msg.seq} answers no frame sent')
-    _, frame_id, flags, _ = self._in_flight.popleft()
+    _, frame_id, flags, sent_at = self._in_flight.popleft()
     if msg.payload.nbytes < P.INFER_RESP_SIZE:
       self.dead = True
       raise LinkError('inference response is missing its header')
     fid, status, gpu_us, queue_us, total_us = P.unpack_infer_resp(msg.payload)
     self.last_timings = (gpu_us, queue_us, total_us)
+    self._keep_reply(Reply(fid, gpu_us, queue_us, total_us, sent_at, time.monotonic()))
     if status == P.Status.NOT_FINITE and fid == frame_id:
       # the server's session goes on, keeping nothing of the frame
       # (Session.infer), so the link stays and last_output is the one before

@@ -15,7 +15,9 @@ code that drives.
 """
 from __future__ import annotations
 
+import collections
 import contextlib
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -49,6 +51,11 @@ def spec_for(inputs: dict) -> ModelSpec:
                    output_slices={k: slice(*v) for k, v in SLICES.items()}, checkpoint=None)
 
 
+# jetlink.client.Reply's fields, without importing the client (and numpy's
+# transports) into a test of the model state
+Reply = collections.namedtuple('Reply', 'frame_id gpu_us queue_us total_us sent_at landed_at')
+
+
 class FakeClient:
   def __init__(self):
     self.nonce = 'test-session'
@@ -78,6 +85,19 @@ class FakeClient:
     # frames (by frame_id) the server answers Status.NOT_FINITE, which the
     # client raises, the link kept
     self.not_finite: set[int] = set()
+    # each frame's own answer, kept as JetlinkClient.replies does, and the
+    # server timings a reply carries (gpu_us, queue_us, total_us)
+    self.replies: dict[int, Reply] = {}
+    self.timings_for: dict[int, tuple[int, int, int]] = {}
+    self._sent_at: dict[int, float] = {}
+
+  def _keep_reply(self, frame_id: int) -> None:
+    gpu_us, queue_us, total_us = self.timings_for.get(frame_id, (0, 0, 0))
+    self.replies[frame_id] = Reply(frame_id, gpu_us, queue_us, total_us,
+                                   self._sent_at.get(frame_id, 0.0), time.monotonic())
+
+  def reply_for(self, frame_id: int) -> Reply | None:
+    return self.replies.get(frame_id)
 
   def infer_begin(self, data, packed, frame_id, reset=False, want_state=False, skip_if_busy=False):
     self.skippable.append(skip_if_busy)
@@ -86,6 +106,7 @@ class FakeClient:
     self.sent.append((np.frombuffer(bytes(data), np.uint8).copy(), np.array(packed, copy=True), frame_id, reset))
     self.asked.append(want_state)
     self._in_flight.append(frame_id)
+    self._sent_at[frame_id] = time.monotonic()
     return frame_id
 
   def infer_end(self, seq, hold=None):
@@ -95,6 +116,7 @@ class FakeClient:
     self._in_flight.remove(seq)
     if seq in self.not_finite:
       raise P.NotFinite(f'inference output is not finite: NOT_FINITE (frame {seq})')
+    self._keep_reply(seq)
     self.last_output = self.output
     self._piggyback()
     return self.output
@@ -104,6 +126,8 @@ class FakeClient:
     self.drains += 1
     back = next((i for i, f in enumerate(self._in_flight) if f in self.keep), len(self._in_flight))
     taken, self._in_flight = self._in_flight[:back], self._in_flight[back:]
+    for frame_id in taken:
+      self._keep_reply(frame_id)
     if taken:
       self.last_output = self.output
       self._piggyback()
@@ -295,6 +319,39 @@ class TestHold(ModelStateTest):
     client.late = {2}
     self._second_frame_held(client)
     self.assertTrue(any('held' in line for line in self.log.lines('warning')))
+
+  def test_a_held_frames_line_does_not_claim_another_frames_server_time(self):
+    # last_timings is the last reply read, which on a held frame is an earlier
+    # frame's: the line says only that this one's reply is not back
+    client = FakeClient()
+    client.late = {2}
+    client.timings_for = {1: (24_000, 100, 25_000), 2: (26_000, 100, 27_600)}
+    self._second_frame_held(client)
+    held = next(line for line in self.log.lines('warning') if ' held ' in line)
+    self.assertIn('its reply is not back yet', held)
+    self.assertNotIn('server gpu', held)
+
+  def test_the_held_frames_own_answer_is_logged_when_it_lands(self):
+    client = FakeClient()
+    client.late = {2}
+    client.timings_for = {2: (26_000, 100, 27_600)}
+    state = self.make(spec_for(STATEFUL), client)
+    client.output[slice(*SLICES['plan'])] = 1.0
+    self.frames(state, 1)
+    self.frames(state, 3)
+    late = next(line for line in self.log.lines('warning') if 'was answered' in line)
+    self.assertIn('held frame 2 was answered', late)
+    self.assertIn('server gpu 26.0 queue 0.1 total 27.6 ms', late)
+    self.assertIsNone(state._held_frame, 'said once')
+
+  def test_a_held_frames_answer_says_nothing_until_it_lands(self):
+    client = FakeClient()
+    client.late = {2}
+    state = self.make(spec_for(STATEFUL), client)
+    self.frames(state, 1)
+    self.frames(state, 1)
+    self.assertEqual(state._held_frame, 2)
+    self.assertFalse(any('was answered' in line for line in self.log.lines('warning')))
 
   def test_the_hold_is_the_rest_of_the_frame_budget(self):
     _, state, client, _ = self.run_frames(STATEFUL, n=3)

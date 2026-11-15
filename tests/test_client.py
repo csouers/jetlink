@@ -134,6 +134,23 @@ class FramesInFlight(SocketPairTest):
     self.assertEqual(self.client.last_output[0], 2.0, 'the newest reply is what a held frame publishes')
     self.assertFalse(self.client.dead)
 
+  def test_a_held_frame_keeps_its_own_answer_for_the_log(self):
+    # last_timings is whichever reply was read last, so a held frame's log
+    # asks reply_for: None while its reply is out, that frame's once it lands
+    seq1 = self.send(1)
+    request = self.peer.recv(timeout=2.0)   # not answered yet
+    self.assertIsNone(self.client.infer_end(seq1, hold=0.01))
+    frame_id = P.unpack_infer_req(request.payload)[0]
+    self.assertIsNone(self.client.reply_for(frame_id))
+    self.peer.send(P.Msg.INFER_RESP, request.seq, (reply(np.ones(self.client.spec.reply_nelem), frame_id=frame_id),))
+    seq2 = self.send(2)
+    self.answer()
+    self.client.infer_end(seq2)
+    late = self.client.reply_for(frame_id)
+    self.assertIsNotNone(late, 'the held frame')
+    self.assertLessEqual(late.sent_at, late.landed_at)
+    self.assertIsNone(self.client.reply_for(frame_id + 99))
+
   def test_a_frame_given_up_on_is_read_quietly_by_the_next(self):
     seq1 = self.send(1)
     request = self.peer.recv(timeout=2.0)   # not answered yet
