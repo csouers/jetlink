@@ -201,6 +201,7 @@ final class Session: @unchecked Sendable {
     }
     lastSeq = message.seq
     switch type {
+    case .camera: onCamera(message)
     case .inferReq: try onInfer(message)
     case .ping: try onPing(message)
     case .engineReq: try onEngineReq(message)
@@ -386,7 +387,20 @@ final class Session: @unchecked Sendable {
   /// Runs the frame under the host's lock, then replies outside it: over USB
   /// the write waits for the comma to read, and nothing else that needs the
   /// host (status, a build's progress, the control channel) should wait with it.
+  /// The comma's camera frame, on its own message: no reply, no deadline shared
+  /// with a model frame. Nothing here can fail the session; the file is for this
+  /// machine's consumers (the dashboard's live source).
+  private func onCamera(_ message: Message) {
+    CameraIngest.frames += 1
+    if CameraIngest.frames == 1 || CameraIngest.frames % 100 == 0 {
+      log.info("camera frames so far: \(CameraIngest.frames), last \(message.payload.count) bytes")
+    }
+    guard message.payload.count > 0 else { return }
+    CameraIngest.store(message.payload, frameID: message.seq)
+  }
+
   private func onInfer(_ message: Message) throws {
+    if message.payload.count > 400_000 { log.info("INFER SIZE PROBE \(message.payload.count)") }
     let (sha, skip) = wanted()
     host.lock.lock()
     guard let loaded = host.loaded, loaded.sha256 == sha, loaded.spec.frameSkip == skip, !host.benchmarking else {
@@ -518,9 +532,33 @@ final class Session: @unchecked Sendable {
     }
   }
 
+  /// The comma's own camera frame, for the host's consumers (the dashboard reads
+  /// it as a live source). `~/.jetlink-camera-file` names the path, else
+  /// `/tmp/jetlink-camera.bin`: a 16-byte header (arrival time, frame id) then the
+  /// NV12 the comma sent. Replaced atomically, so a reader never sees half a frame.
+  private static func writeCameraFrame(_ blob: UnsafeRawBufferPointer, frameID: UInt32) {
+    var path = "/tmp/jetlink-camera.bin"
+    if let cfg = try? String(contentsOf: URL(fileURLWithPath: NSHomeDirectory() + "/.jetlink-camera-file"), encoding: .utf8) {
+      let named = cfg.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !named.isEmpty { path = named }
+    }
+    var data = Data(capacity: blob.count + 16)
+    var stamp = DispatchTime.now().uptimeNanoseconds / 1_000_000
+    withUnsafeBytes(of: &stamp) { data.append(contentsOf: $0) }
+    var fid = frameID
+    withUnsafeBytes(of: &fid) { data.append(contentsOf: $0) }
+    data.append(contentsOf: blob)
+    try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
+  }
+
   /// The dashboard's most recent pane, when one is being published and is fresh.
   /// `~/.jetlink-pane-file` names the path (else `/tmp/jetlink-pane.bin`); the
   /// pane_pub writer replaces the file atomically, so a read is always whole.
+  // The pane file is replaced by another process ~10 times a second. Reading it on
+  // every reply cost 386 KB of disk per frame and showed up as the model falling
+  // behind, so keep the last one and only re-read when the file's stamp moves.
+  nonisolated(unsafe) private static var paneCache: (stamp: Date, data: Data?)?
+
   private static func publishedPane() -> Data? {
     var path = "/tmp/jetlink-pane.bin"
     if let cfg = try? String(contentsOf: URL(fileURLWithPath: NSHomeDirectory() + "/.jetlink-pane-file"), encoding: .utf8) {
@@ -528,11 +566,18 @@ final class Session: @unchecked Sendable {
       if !named.isEmpty { path = named }
     }
     guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
-          let modified = attrs[.modificationDate] as? Date,
-          Date().timeIntervalSince(modified) < 0.5,
-          let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-          data.count == Wire.paneBytes + 16 else { return nil }
-    return data.subdata(in: 16..<data.count)
+          let modified = attrs[.modificationDate] as? Date else { return nil }
+    if let cache = paneCache, cache.stamp == modified {
+      return cache.data
+    }
+    var data: Data?
+    if Date().timeIntervalSince(modified) < 0.5,
+       let blob = try? Data(contentsOf: URL(fileURLWithPath: path)),
+       blob.count == Wire.paneBytes + 16 {
+      data = blob.subdata(in: 16..<blob.count)
+    }
+    paneCache = (modified, data)
+    return data
   }
 
   /// A placeholder pane in the dashboard's shape: grey road, a heat blob that
@@ -572,6 +617,9 @@ final class Session: @unchecked Sendable {
   }
 
   /// The frame itself: stage, run, read the output back. Caller holds `host.lock`.
+  @inline(never)
+  private static func requestBytes(_ layout: FrameLayout) -> Int { layout.requestBytes }
+
   private func infer(_ loaded: Loaded, _ message: Message) -> InferReply {
     let started = DispatchTime.now().uptimeNanoseconds
     host.lastSeenAt = ProcessInfo.processInfo.systemUptime
@@ -586,6 +634,18 @@ final class Session: @unchecked Sendable {
     let flags = Wire.Flag(rawValue: UInt32(littleEndian: base.loadUnaligned(fromByteOffset: 4, as: UInt32.self)))
     if flags.contains(.resetQueues) {
       loaded.staging.reset()
+    }
+    // the camera frame rides after the packed inputs; @inline(never) keeps the
+    // optimizer from folding the comparison against a value it thinks it knows
+    let cameraOffset = Session.requestBytes(layout)
+    if message.payload.count != cameraOffset {
+      log.info("payload count vs request: \(message.payload.count) vs \(cameraOffset)")
+    }
+    if message.payload.count > cameraOffset {
+      log.info("camera frame for the host: \(message.payload.count - cameraOffset) bytes")
+      CameraIngest.store(
+        UnsafeRawBufferPointer(start: base + cameraOffset, count: message.payload.count - cameraOffset),
+        frameID: frameID)
     }
     let warped = base + Wire.inferReqSize
 

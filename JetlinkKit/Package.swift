@@ -1,4 +1,4 @@
-// swift-tools-version: 6.2
+// swift-tools-version: 6.1
 //
 // The Swift half of jetlink: the server, and what the apps share. One manifest
 // for every platform: what differs is conditioned on the platform being built
@@ -37,7 +37,7 @@ let crypto: Target.Dependency = .product(name: "Crypto", package: "swift-crypto"
 
 let package = Package(
   name: "JetlinkKit",
-  platforms: [.macOS(.v15), .iOS(.v26)],
+  platforms: [.macOS(.v15), .iOS(.v18)],
   products: [
     .library(name: "JetlinkKit", targets: ["JetlinkKit"]),
     .library(name: "JetlinkUI", targets: ["JetlinkUI"]),

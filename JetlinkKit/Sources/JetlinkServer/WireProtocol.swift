@@ -62,6 +62,7 @@ public enum Wire {
     case shutdownResp = 18
     /// The client stops using the link and says why, with what it measured;
     /// no reply. The connection may stay for a later hello.
+    case camera = 20
     case leave = 19
   }
 
@@ -75,6 +76,10 @@ public enum Wire {
     /// On INFER_REQ: keep hidden_state in the response, for a comma logging
     /// the whole output vector.
     public static let wantHidden = Flag(rawValue: 1 << 2)
+    /// On INFER_REQ: the camera frame rides after the packed inputs, as a
+    /// 12-byte header (width, height, stride) then NV12. The host keeps the
+    /// newest for its own consumers (the dashboard's live source).
+    public static let camera = Flag(rawValue: 1 << 4)
     /// On INFER_REQ: carry the dashboard's pane in the response — a u32 byte
     /// count then the bytes, ahead of any telemetry (see paneBytes). A server
     /// that does not know the flag sends none, so an old comma sees v3 exactly.

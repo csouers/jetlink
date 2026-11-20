@@ -450,7 +450,8 @@ class JetlinkClient:
 
   def infer_begin(self, warped: np.ndarray, packed: np.ndarray, frame_id: int = 0,
                   reset: bool = False, want_state: bool = False, deadline: float | None = None,
-                  skip_if_busy: bool = False, want_pane: bool = False) -> int | None:
+                  skip_if_busy: bool = False, want_pane: bool = False,
+                  camera: bytes | None = None) -> int | None:
     """Send a frame and return immediately with its sequence number.
 
     Split from infer_end so the caller can work while the Jetson is busy;
@@ -480,8 +481,11 @@ class JetlinkClient:
     seq = self._next_seq()
     flags = ((P.Flag.RESET_QUEUES if reset else 0) | (P.Flag.WANT_STATE if want_state else 0)
              | (P.Flag.WANT_HIDDEN if self.want_hidden else 0)
-             | (P.Flag.WANT_PANE if want_pane else 0))
+             | (P.Flag.WANT_PANE if want_pane else 0)
+             | (P.Flag.CAMERA if camera is not None else 0))
     parts = (P.pack_infer_req(frame_id, flags), warped, packed)
+    if camera is not None:
+      parts = parts + (camera,)   # CAMERA_HDR then NV12; see P.Flag.CAMERA
     sent = Sent(seq, frame_id, flags, time.monotonic())
     timeout = self.deadline if deadline is None else deadline
     try:
@@ -698,6 +702,19 @@ class JetlinkClient:
     """
     return self.infer_end(self.infer_begin(warped, packed, frame_id, reset, want_state, deadline,
                                             want_pane=want_pane), deadline)
+
+  def send_camera(self, payload: bytes, timeout: float = 0.02) -> bool:
+    """Hand the host the camera frame that just went with this tick, as its own
+    message. Never raises and never waits long: a frame the link cannot take this
+    instant is a frame the host does without, which is the whole point of not
+    putting it inside an INFER_REQ."""
+    if self.dead or self.spec is None or not payload:
+      return False
+    seq = self._next_seq()
+    try:
+      return bool(self.t.try_send(P.Msg.CAMERA, seq, (payload,), timeout=timeout))
+    except Exception:
+      return False
 
   @property
   def lendable(self) -> bool:

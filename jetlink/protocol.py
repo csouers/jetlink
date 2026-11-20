@@ -88,6 +88,9 @@ class Msg(IntEnum):
   PONG = 16
   SHUTDOWN_REQ = 17    # json: {reason} -> power the Jetson off for good; see JetlinkClient.shutdown
   SHUTDOWN_RESP = 18   # json: {ok, detail}
+  CAMERA = 20          # camera hdr (w, h, stride) + NV12, comma -> host, no reply.
+                       # Its own message so a frame too big or too late can
+                       # never sit inside an INFER_REQ's deadline.
   LEAVE = 19           # json: {reason, ...what the client measured}; client -> server, no reply.
                        # The client stops using the link: it handed the model back or is exiting.
                        # The connection may stay for a later HELLO_REQ. An older server answers
@@ -117,6 +120,9 @@ class Flag(IntEnum):
                           # view of the same frame, 536x240 RGB as the mici screen
                           # draws it. A server that does not know the flag sends
                           # none, so this costs an old peer nothing.
+  CAMERA = 1 << 4         # on INFER_REQ: the camera frame rides after the packed
+                          # inputs, as CAMERA_HDR then NV12 (see CAMERA_*).
+                          # The host keeps the newest one for its own consumers.
   PADDED = 1 << 7         # one pad byte follows the payload; see PACKET_MULTIPLE
 
 
@@ -141,6 +147,10 @@ PANE_BYTES = PANE_WIDTH * PANE_HEIGHT * PANE_CHANNELS
 
 # Ahead of the bytes so a client can tell a pane from telemetry it did not ask
 # for: [head][outputs][u32 nbytes][bytes][telemetry]
+CAMERA_HDR_FMT = '<III'   # width, height, stride: NV12 follows, stride in bytes per row
+CAMERA_HDR_SIZE = struct.calcsize(CAMERA_HDR_FMT)
+_camera_hdr = struct.Struct(CAMERA_HDR_FMT)
+
 PANE_LEN_FMT = '<I'
 PANE_LEN_SIZE = struct.calcsize(PANE_LEN_FMT)
 _pane_len = struct.Struct(PANE_LEN_FMT)
@@ -217,6 +227,14 @@ def pack_infer_req(frame_id: int, flags: int = 0) -> bytes:
 
 def unpack_infer_req(buf, offset: int = 0) -> tuple[int, int]:
   return _infer_req.unpack_from(buf, offset)
+
+
+def pack_camera_hdr(width: int, height: int, stride: int) -> bytes:
+  return _camera_hdr.pack(width, height, stride)
+
+
+def unpack_camera_hdr(buf, offset: int = 0) -> tuple[int, int, int]:
+  return _camera_hdr.unpack_from(buf, offset)
 
 
 def pack_pane_len(nbytes: int) -> bytes:

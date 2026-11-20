@@ -49,6 +49,65 @@ PANE_HDR = struct.Struct('<dQ')  # when it arrived, frame id, then the RGB pane
 # on a clock-capped comma.
 PANE_FLAG_FILE = '/data/pane_view'
 
+# The camera uplink: the comma's own frame rides in every other INFER_REQ (10 Hz at
+# the model's 20) so the host's dashboard stops needing a replay. Off unless asked
+# for, like the pane: 1.5 MB a frame at 10 Hz is real wire and real CPU.
+CAMERA_FLAG_FILE = '/data/camera_uplink'
+CAMERA_STRIDE = 1344
+CAMERA_WIDTH = 1344
+CAMERA_HEIGHT = 760
+CAMERA_BYTES = CAMERA_WIDTH * CAMERA_HEIGHT * 3 // 2   # NV12
+_camera_src = None
+
+
+def _camera_hdr_for(src) -> bytes:
+  from jetlink.protocol import pack_camera_hdr
+  return pack_camera_hdr(src.width, src.height, src.stride)
+
+
+def _camera_enabled() -> bool:
+  return os.environ.get('JETLINK_CAMERA') == '1' or os.path.exists(CAMERA_FLAG_FILE)
+
+
+_camera_err = None
+CAMERA_STATS = '/data/camera_stats'
+_stats_last = 0.0
+
+
+def _camera_stats(**fields) -> None:
+  """One JSON line a second: what the uplink is doing, for a link that cannot be
+  read from the process that runs it."""
+  global _stats_last
+  now = time.monotonic()
+  if now - _stats_last < 1.0:
+    return
+  _stats_last = now
+  try:
+    import json
+    fields['t'] = round(now, 2)
+    with open(CAMERA_STATS, 'w') as f:
+      json.dump(fields, f)
+  except Exception:
+    pass
+
+
+def _camera_source():
+  """This process's camera thread, made once; None when it cannot be made, which
+
+  retires the uplink for the process instead of failing frames."""
+  global _camera_src
+  if _camera_src is None:
+    try:
+      from jetlink.openpilot.camera_uplink import CameraUplink
+      _camera_src = CameraUplink(CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_STRIDE)
+      _camera_src.start()
+    except Exception as e:
+      global _camera_err
+      import traceback
+      _camera_err = "%s: %s" % (type(e).__name__, e)
+      _camera_src = False
+  return _camera_src or None
+
 _pane_pub = None
 
 
@@ -192,6 +251,15 @@ class JetlinkModelState:
     # (see PANE_*): read once, since a flip mid-drive would change the response
     # layout under a frame already in flight
     self._want_pane = _pane_enabled()
+    # carry the comma's own camera to the host on every other frame (10 Hz at
+    # the model's 20): the dashboard on the host replaces a replay feed with it
+    self._want_camera = _camera_enabled()
+    self._camera_tick = 0
+    # The camera makes a request ~1.6 MB, and the join's proving frames cannot pay
+    # that: measured, a 1.6 MB first frame took 82 ms and the model handed straight
+    # back to the small one. So no camera until the link has run clean for a while,
+    # and none for a while after any hold.
+    self._camera_ok_from = 200
 
     # a warp.Warp or the adapter's model_warp, loaded and warmed ahead: its
     # first call links the JIT, and this runs on modeld's frame thread. Frames
@@ -236,6 +304,50 @@ class JetlinkModelState:
     # line was written, so _note_late_reply reports what it was answered with
     self._held_frame: int | None = None
     self._held_gave_up = 0.0
+
+  def _send_camera(self) -> None:
+    """Header + NV12 for this frame, on alternate frames, or None. Never raises:
+    the uplink is a convenience for the host, not a driving input."""
+    if self._frame_id % 200 == 0:
+      self._log.warning("jetlink: camera dbg want=%s frame=%d ok_from=%d held=%s",
+                        self._want_camera, self._frame_id, self._camera_ok_from, self.held)
+    if not self._want_camera:
+      return
+    # The link is the model's first: no camera until it has run clean for a while,
+    # and none for a while after any hold (a 1.6 MB frame inside the request once
+    # took the first reply to 82 ms and the model handed straight back).
+    if self._frame_id < self._camera_ok_from or self.held:
+      return
+    # Only on a link that is comfortably keeping up: a camera frame beside a slow
+    # one is what took the sessions to p99 46 / max 1.5 s and the model behind.
+    total_us = self.client.last_timings[2] if self.client.last_timings else 0
+    if total_us > 30_000:
+      return
+    self._camera_tick += 1
+    if self._camera_tick % 4:      # every fourth frame: 5 Hz at the model's 20
+      return
+    src = _camera_source()
+    _camera_stats(stage='src', src=bool(src), frames=getattr(src, 'frames', None) if src else None,
+                  err=getattr(src, 'error', None) if src else _camera_err)
+    if src is None:
+      self._log.warning("jetlink: camera uplink unavailable: %s", _camera_err)
+      self._want_camera = False
+      return
+    got = src.latest()
+    _camera_stats(stage='latest', got=bool(got), frames=getattr(src, 'frames', None))
+    if got is None:
+      if not getattr(self, '_camera_starved', False):
+        self._camera_starved = True
+        self._log.warning("jetlink: camera uplink has no frames (thread frames=%s connected=%s)",
+                          getattr(src, 'frames', None), getattr(src, 'connected', None))
+      return
+    frame, _ = got
+    ok = self.client.send_camera(_camera_hdr_for(src) + frame)
+    _camera_stats(stage='send', ok=ok, bytes=len(frame), frame_id=self._frame_id)
+    if ok and not getattr(self, '_camera_logged', False):
+      self._camera_logged = True
+      self._log.warning("jetlink: camera uplink on, %d bytes a frame (%dx%d stride %d)",
+                        len(frame) + 12, src.width, src.height, src.stride)
 
   def _publish_pane(self) -> None:
     """The pane this frame's reply carried, to the UI. Never raises: it is a view."""
@@ -345,8 +457,11 @@ class JetlinkModelState:
         raise
     if self._want_pane and model_output is not None:
       self._publish_pane()
+    self._send_camera()
     t4 = time.perf_counter()
     held = self.held = model_output is None
+    if held and self._want_camera:
+      self._camera_ok_from = self._frame_id + 100
     self.behind = self._note_hold(held)
     if held:
       self._held_frame, self._held_gave_up = self._frame_id, t4
