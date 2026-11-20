@@ -27,6 +27,7 @@ tinygrad is warp.Warp's to import: only modeld has it.
 from __future__ import annotations
 
 import os
+import struct
 import time
 from collections import deque
 from collections.abc import Callable
@@ -35,6 +36,37 @@ from dataclasses import dataclass
 import numpy as np
 
 from jetlink.protocol import NotFinite
+
+# The dashboard's composite pane rides back with the frame that asked for it (see
+# protocol Flag.WANT_PANE). It is for the screen, never for control, so every failure
+# here is swallowed: a drive must not care whether a pane arrived.
+PANE_ENDPOINT = 'paneView'
+# msgq asserts 3 * message <= queue; a 386 KB pane needs a segment over 1.16 MB and
+# an endpoint outside SERVICES gets a smaller default.
+PANE_SEGMENT = 8 << 20
+PANE_HDR = struct.Struct('<dQ')  # when it arrived, frame id, then the RGB pane
+# Off unless asked for: publishing 386 KB costs modeld's thread up to ~4 ms a frame
+# on a clock-capped comma.
+PANE_FLAG_FILE = '/data/pane_view'
+
+_pane_pub = None
+
+
+def _pane_enabled() -> bool:
+  return os.environ.get('JETLINK_PANE') == '1' or os.path.exists(PANE_FLAG_FILE)
+
+
+def _pane_publisher():
+  """This process's pane socket, made once. None when msgq cannot take it, which
+  retires the pane for the process rather than failing a frame."""
+  global _pane_pub
+  if _pane_pub is None:
+    try:
+      import msgq
+      _pane_pub = msgq.pub_sock(PANE_ENDPOINT, PANE_SEGMENT)
+    except Exception:
+      _pane_pub = False
+  return _pane_pub or None
 
 SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
 SLOW_FRAME = 0.05  # the full 20 Hz budget, not just the largest outliers
@@ -156,6 +188,10 @@ class JetlinkModelState:
     # not chestnut hardware, but the same role: modelV2.big, the UI and the
     # model manager key off this flag
     self.chestnut = True
+    # ask each frame for the dashboard's pane, and republish it to the UI process
+    # (see PANE_*): read once, since a flip mid-drive would change the response
+    # layout under a frame already in flight
+    self._want_pane = _pane_enabled()
 
     # a warp.Warp or the adapter's model_warp, loaded and warmed ahead: its
     # first call links the JIT, and this runs on modeld's frame thread. Frames
@@ -200,6 +236,24 @@ class JetlinkModelState:
     # line was written, so _note_late_reply reports what it was answered with
     self._held_frame: int | None = None
     self._held_gave_up = 0.0
+
+  def _publish_pane(self) -> None:
+    """The pane this frame's reply carried, to the UI. Never raises: it is a view."""
+    pane = self.client.last_pane
+    if pane is None:
+      return
+    pub = _pane_publisher()
+    if pub is None:
+      self._want_pane = False
+      return
+    frame_id, received_at, rgb = pane
+    if not rgb:
+      return   # an empty slice: the server sent the count and no bytes this frame
+    try:
+      pub.send(PANE_HDR.pack(received_at, frame_id) + bytes(rgb))
+    except Exception as e:
+      self._want_pane = False
+      self._log.warning('jetlink: pane publish failed, dropping panes: %s', e)
 
   def slice_outputs(self, model_outputs: np.ndarray, output_slices: dict[str, slice]) -> dict[str, np.ndarray]:
     return {k: model_outputs[np.newaxis, v] for k, v in output_slices.items()}
@@ -260,7 +314,8 @@ class JetlinkModelState:
     frame.telemetry = want_telemetry or time.monotonic() - self._last_logged >= TELEMETRY_PERIOD
     try:
       frame.seq = self.client.infer_begin(self.warp.output, self.packed, self._frame_id, reset=self._need_reset,
-                                          want_state=frame.telemetry, skip_if_busy=self._can_hold)
+                                          want_state=frame.telemetry, skip_if_busy=self._can_hold,
+                                          want_pane=self._want_pane)
     except Exception:
       self._log.warning("jetlink: frame %d send failed: %s", self._frame_id, getattr(self.client.t, 'last_send', {}))
       raise
@@ -288,6 +343,8 @@ class JetlinkModelState:
         # answered, so the leave's summary counts it
         self.trips.record(time.perf_counter() - frame.t0, self.client.last_timings[2])
         raise
+    if self._want_pane and model_output is not None:
+      self._publish_pane()
     t4 = time.perf_counter()
     held = self.held = model_output is None
     self.behind = self._note_hold(held)

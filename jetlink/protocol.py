@@ -111,6 +111,12 @@ class Flag(IntEnum):
   WANT_HIDDEN = 1 << 2    # on INFER_REQ: keep hidden_state in the response, for
                           # a caller logging the whole output vector. 64 KB more
                           # on the big models; nothing else needs it.
+  WANT_PANE = 1 << 3      # on INFER_REQ: carry a pane slice in the response, a
+                          # u32 byte count then the bytes, ahead of any telemetry
+                          # (see PANE_*). The pane is the dashboard's composite
+                          # view of the same frame, 536x240 RGB as the mici screen
+                          # draws it. A server that does not know the flag sends
+                          # none, so this costs an old peer nothing.
   PADDED = 1 << 7         # one pad byte follows the payload; see PACKET_MULTIPLE
 
 
@@ -123,6 +129,21 @@ _infer_req = struct.Struct(INFER_REQ_FMT)
 INFER_RESP_FMT = '<IIIII'
 INFER_RESP_SIZE = struct.calcsize(INFER_RESP_FMT)
 _infer_resp = struct.Struct(INFER_RESP_FMT)
+
+# The pane a WANT_PANE response carries: the mici screen at 1:1, which is what
+# the dashboard's composite pane already is (its panes are 536x240 in screen
+# coordinates). RGB, no alpha, no scaling. PANE_BYTES is a whole pane; the
+# server may send fewer bytes for a partly refreshed one, or zero.
+PANE_WIDTH = 536
+PANE_HEIGHT = 240
+PANE_CHANNELS = 3
+PANE_BYTES = PANE_WIDTH * PANE_HEIGHT * PANE_CHANNELS
+
+# Ahead of the bytes so a client can tell a pane from telemetry it did not ask
+# for: [head][outputs][u32 nbytes][bytes][telemetry]
+PANE_LEN_FMT = '<I'
+PANE_LEN_SIZE = struct.calcsize(PANE_LEN_FMT)
+_pane_len = struct.Struct(PANE_LEN_FMT)
 
 
 # A frame over the phone's cable as UDP datagrams (TcpTransport.use_datagrams):
@@ -196,6 +217,14 @@ def pack_infer_req(frame_id: int, flags: int = 0) -> bytes:
 
 def unpack_infer_req(buf, offset: int = 0) -> tuple[int, int]:
   return _infer_req.unpack_from(buf, offset)
+
+
+def pack_pane_len(nbytes: int) -> bytes:
+  return _pane_len.pack(nbytes)
+
+
+def unpack_pane_len(buf, offset: int = 0) -> int:
+  return _pane_len.unpack_from(buf, offset)[0]
 
 
 def pack_infer_resp(frame_id: int, status: int, gpu_us: int, queue_us: int, total_us: int) -> bytes:

@@ -40,10 +40,16 @@ final class Session: @unchecked Sendable {
   private var outputCapacity: Int
   /// The reply's fixed head, packed in place every frame.
   private let responseHead: UnsafeMutableRawPointer
-  /// The reply's parts: head, the outputs either side of hidden_state, and
-  /// the telemetry when asked for.
+  /// The reply's parts: head, the outputs either side of hidden_state, the
+  /// pane's byte count and the pane, and the telemetry when asked for.
   private let parts: UnsafeMutablePointer<UnsafeRawBufferPointer>
-  private static let maxParts = 4
+  private static let maxParts = 6
+  /// WANT_PANE's slice: the u32 count that tells a pane from telemetry, then
+  /// the pane itself, both reused every frame like the head and outputs.
+  private let paneLength: UnsafeMutablePointer<UInt32>
+  private let paneBuffer: UnsafeMutablePointer<UInt8>
+  /// What the canned pane animates off; real panes come from the dashboard.
+  private var paneFrame: UInt32 = 0
 
   init(transport: any MessageLink, host: EngineHost) {
     self.transport = transport
@@ -54,12 +60,18 @@ final class Session: @unchecked Sendable {
     responseHead = .allocate(byteCount: Wire.inferRespSize, alignment: 8)
     parts = .allocate(capacity: Session.maxParts)
     parts.initialize(repeating: UnsafeRawBufferPointer(start: nil, count: 0), count: Session.maxParts)
+    paneLength = .allocate(capacity: 1)
+    paneLength.pointee = UInt32(littleEndian: UInt32(Wire.paneBytes))
+    paneBuffer = .allocate(capacity: Wire.paneBytes)
+    paneBuffer.initialize(repeating: 0, count: Wire.paneBytes)
   }
 
   deinit {
     outputBuffer.deallocate()
     responseHead.deallocate()
     parts.deallocate()
+    paneLength.deallocate()
+    paneBuffer.deallocate()
   }
 
   var peer: String { transport.peer }
@@ -427,6 +439,8 @@ final class Session: @unchecked Sendable {
     var ran = false
     /// Why it failed, when it did.
     var failure: (any Error)?
+    /// This frame asked for the pane, so one rides back with it.
+    var wantPane = false
   }
 
   /// INFER_RESP: the head, the output buffer less hidden_state, and the
@@ -445,6 +459,22 @@ final class Session: @unchecked Sendable {
       parts[1] = UnsafeRawBufferPointer(start: outputBuffer, count: reply.outputCount * 4)
       count = 2
     }
+    if reply.wantPane {
+      // [head][outputs][u32 nbytes][pane][telemetry]: the count is what lets the
+      // comma tell the pane from telemetry it did not ask for. How much rides
+      // back is what an experiment turns: `empty` still pays the count and the
+      // reply's framing but no bytes, which separates the cost of the bytes on
+      // the wire from the cost of filling and copying them.
+      let paneBytes = self.paneBytesThisFrame(reply.frameID)
+      paneLength.pointee = UInt32(littleEndian: UInt32(paneBytes))
+      parts[count] = UnsafeRawBufferPointer(start: paneLength, count: MemoryLayout<UInt32>.size)
+      count += 1
+      if paneBytes > 0 {
+        Self.drawPane(into: paneBuffer, frame: reply.frameID)
+        parts[count] = UnsafeRawBufferPointer(start: paneBuffer, count: paneBytes)
+        count += 1
+      }
+    }
     if let state {
       try state.withUnsafeBytes { bytes in
         parts[count] = bytes
@@ -452,6 +482,64 @@ final class Session: @unchecked Sendable {
       }
     } else {
       try transport.sendParts(.inferResp, seq: seq, parts: UnsafeBufferPointer(start: parts, count: count), flags: [])
+    }
+  }
+
+  /// How many pane bytes this frame carries, from the mode file below. Re-read
+  /// every quarter second of frames, so an experiment can flip it without a
+  /// rebuild or a restart.
+  private var paneMode: (name: String, readAt: UInt32) = ("full", 0)
+  private static let paneModes = ["full", "half", "empty", "off"]
+  private static var paneModeURL: URL {
+    URL(fileURLWithPath: NSHomeDirectory() + "/.jetlink-pane-mode")
+  }
+
+  private func paneBytesThisFrame(_ frameID: UInt32) -> Int {
+    if frameID &- paneMode.readAt >= 240 || paneMode.readAt == 0 {
+      let text = (try? String(contentsOf: Session.paneModeURL, encoding: .utf8))?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "full"
+      paneMode = (Session.paneModes.contains(text) ? text : "full", frameID)
+    }
+    switch paneMode.name {
+    case "off", "empty": return 0
+    case "half": return frameID & 1 == 0 ? Wire.paneBytes : 0
+    default: return Wire.paneBytes
+    }
+  }
+
+  /// A placeholder pane in the dashboard's shape: grey road, a heat blob that
+  /// drifts, a green lead, black lanes. The dashboard's real composite replaces
+  /// this once the camera uplink exists; what it proves today is the reply's
+  /// layout, the USB round trip and the UI widget.
+  private static func drawPane(into buffer: UnsafeMutablePointer<UInt8>, frame: UInt32) {
+    let w = Wire.paneWidth, h = Wire.paneHeight
+    let cx = Double(w) * 0.5 + 70.0 * sin(Double(frame) * 0.04)
+    let leadX = Int(cx)
+    let leadTop = Int(Double(h) * 0.34), leadBottom = Int(Double(h) * 0.50)
+    for y in 0..<h {
+      let dy = (Double(y) - Double(h) * 0.58) / 52.0
+      for x in 0..<w {
+        var r = 70.0, g = 70.0, b = 70.0
+        let dx = (Double(x) - cx) / 95.0
+        let distance = (dx * dx + dy * dy).squareRoot()
+        if distance < 1.0 {
+          let heat = 1.0 - distance          // moves, so a frozen link is visible
+          r = max(r, 255.0 * heat)
+          g = max(g, 70.0 + 190.0 * heat * heat)
+        }
+        if y >= leadTop && y < leadBottom && x >= leadX - 18 && x < leadX + 18 {
+          r = 0; g = 220; b = 90               // lead
+        }
+        if (x >= 40 && x < 43) || (x >= w - 43 && x < w - 40) {
+          r = 0; g = 0; b = 0                  // lanes
+        }
+        // clamp: a colour computed as a Double can leave 0...255 and UInt8(_:)
+        // traps on that, which would kill the server on the first pane frame
+        let i = (y * w + x) * 3
+        buffer[i] = UInt8(min(255.0, max(0.0, r)))
+        buffer[i + 1] = UInt8(min(255.0, max(0.0, g)))
+        buffer[i + 2] = UInt8(min(255.0, max(0.0, b)))
+      }
     }
   }
 
@@ -519,7 +607,8 @@ final class Session: @unchecked Sendable {
     return InferReply(
       frameID: frameID, status: status, gpuUs: loaded.engine.lastGpuUs, queueUs: queueUs, totalUs: microseconds(since: started),
       outputCount: replied ? count : 0, hidden: replied && !flags.contains(.wantHidden) ? layout.hidden : nil,
-      wantsState: flags.contains(.wantState), ran: true, failure: failure)
+      wantsState: flags.contains(.wantState), ran: true, failure: failure,
+      wantPane: flags.contains(.wantPane))
   }
 
   private func onShutdown(_ message: Message) throws {

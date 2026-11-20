@@ -75,6 +75,10 @@ public enum Wire {
     /// On INFER_REQ: keep hidden_state in the response, for a comma logging
     /// the whole output vector.
     public static let wantHidden = Flag(rawValue: 1 << 2)
+    /// On INFER_REQ: carry the dashboard's pane in the response — a u32 byte
+    /// count then the bytes, ahead of any telemetry (see paneBytes). A server
+    /// that does not know the flag sends none, so an old comma sees v3 exactly.
+    public static let wantPane = Flag(rawValue: 1 << 3)
     /// One pad byte follows the payload; see packetMultiple.
     public static let padded = Flag(rawValue: 1 << 7)
   }
@@ -92,6 +96,13 @@ public enum Wire {
   public static let inferReqSize = Pinned.inferReqSize
   /// INFER_RESP: frame_id, status, gpu_us, queue_us, total_us.
   public static let inferRespSize = Pinned.inferRespSize
+
+  /// The pane a WANT_PANE response carries: the mici screen at 1:1, which is
+  /// what the dashboard's composite pane already is. RGB, no alpha, no scale.
+  public static let paneWidth = 536
+  public static let paneHeight = 240
+  public static let paneChannels = 3
+  public static let paneBytes = paneWidth * paneHeight * paneChannels
 
   public struct Header: Equatable, Sendable {
     public var msgType: UInt16

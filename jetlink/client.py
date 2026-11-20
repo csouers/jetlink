@@ -123,6 +123,10 @@ class JetlinkClient:
     self.dead = False
     self.last_timings = (0, 0, 0)  # gpu_us, queue_us, total_us, server-side
     self.last_state: dict | None = None  # most recent piggybacked telemetry
+    # (frame_id, when it arrived, the bytes) of the dashboard's pane for the last
+    # answered frame, when that frame asked for one; None when it did not, or the
+    # server is one that does not send panes
+    self.last_pane: tuple[int, float, memoryview] | None = None
     # the newest model output read off the link, whichever call read it: what
     # a frame whose own reply is late publishes again (JetlinkModelState.end)
     self.last_output: np.ndarray | None = None
@@ -446,7 +450,7 @@ class JetlinkClient:
 
   def infer_begin(self, warped: np.ndarray, packed: np.ndarray, frame_id: int = 0,
                   reset: bool = False, want_state: bool = False, deadline: float | None = None,
-                  skip_if_busy: bool = False) -> int | None:
+                  skip_if_busy: bool = False, want_pane: bool = False) -> int | None:
     """Send a frame and return immediately with its sequence number.
 
     Split from infer_end so the caller can work while the Jetson is busy;
@@ -475,7 +479,8 @@ class JetlinkClient:
     packed = _as_bytes(packed, self.spec.packed_nbytes, 'packed')
     seq = self._next_seq()
     flags = ((P.Flag.RESET_QUEUES if reset else 0) | (P.Flag.WANT_STATE if want_state else 0)
-             | (P.Flag.WANT_HIDDEN if self.want_hidden else 0))
+             | (P.Flag.WANT_HIDDEN if self.want_hidden else 0)
+             | (P.Flag.WANT_PANE if want_pane else 0))
     parts = (P.pack_infer_req(frame_id, flags), warped, packed)
     sent = Sent(seq, frame_id, flags, time.monotonic())
     timeout = self.deadline if deadline is None else deadline
@@ -649,6 +654,18 @@ class JetlinkClient:
     if msg.payload.nbytes < end:
       self.dead = True
       raise LinkError('inference response is missing model outputs')
+    self.last_pane = None
+    if flags & P.Flag.WANT_PANE and msg.payload.nbytes >= end + P.PANE_LEN_SIZE:
+      # [head][outputs][u32 pane bytes][pane][telemetry]: the count is what tells
+      # a pane from telemetry, and a server that predates the flag sends neither
+      # the count nor the pane, which reads as no pane and still costs the frame
+      pane_nbytes = P.unpack_pane_len(msg.payload, end)
+      start = end + P.PANE_LEN_SIZE
+      if msg.payload.nbytes < start + pane_nbytes:
+        self.dead = True
+        raise LinkError(f'inference response promises {pane_nbytes} pane bytes, carries {msg.payload.nbytes - start}')
+      self.last_pane = (fid, time.monotonic(), msg.payload[start:start + pane_nbytes])
+      end = start + pane_nbytes
     if msg.payload.nbytes > end:
       # piggybacked telemetry, when asked for; anything else is outputs laid
       # out some other way (hidden_state left in by a server that says
@@ -670,7 +687,7 @@ class JetlinkClient:
 
   def infer(self, warped: np.ndarray, packed: np.ndarray, frame_id: int = 0,
             reset: bool = False, deadline: float | None = None,
-            want_state: bool = False) -> np.ndarray:
+            want_state: bool = False, want_pane: bool = False) -> np.ndarray:
     """One frame. Returns the model output as float32, shaped (n,), laid out
     as the spec's output_slices say; hidden_state reads as zeros unless
     `want_hidden`, since it stays on the server.
@@ -679,7 +696,8 @@ class JetlinkClient:
     packed_npy_inputs. Either may be any buffer, so a tinygrad Tensor.data()
     memoryview reaches the wire with no numpy round trip.
     """
-    return self.infer_end(self.infer_begin(warped, packed, frame_id, reset, want_state, deadline), deadline)
+    return self.infer_end(self.infer_begin(warped, packed, frame_id, reset, want_state, deadline,
+                                            want_pane=want_pane), deadline)
 
   @property
   def lendable(self) -> bool:
