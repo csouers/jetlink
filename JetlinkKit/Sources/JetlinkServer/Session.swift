@@ -470,7 +470,18 @@ final class Session: @unchecked Sendable {
       parts[count] = UnsafeRawBufferPointer(start: paneLength, count: MemoryLayout<UInt32>.size)
       count += 1
       if paneBytes > 0 {
-        Self.drawPane(into: paneBuffer, frame: reply.frameID)
+        if let published = Self.publishedPane() {
+          // the dashboard's own composite, written by pane_pub.py: 16-byte header
+          // (send time, frame id) then the RGB pane, so drop the header and use
+          // the rest as-is. Stale or wrong-sized means fall back to the canned one.
+          published.withUnsafeBytes { raw in
+            if let base = raw.bindMemory(to: UInt8.self).baseAddress {
+              paneBuffer.update(from: base, count: Wire.paneBytes)
+            }
+          }
+        } else {
+          Self.drawPane(into: paneBuffer, frame: reply.frameID)
+        }
         parts[count] = UnsafeRawBufferPointer(start: paneBuffer, count: paneBytes)
         count += 1
       }
@@ -505,6 +516,23 @@ final class Session: @unchecked Sendable {
     case "half": return frameID & 1 == 0 ? Wire.paneBytes : 0
     default: return Wire.paneBytes
     }
+  }
+
+  /// The dashboard's most recent pane, when one is being published and is fresh.
+  /// `~/.jetlink-pane-file` names the path (else `/tmp/jetlink-pane.bin`); the
+  /// pane_pub writer replaces the file atomically, so a read is always whole.
+  private static func publishedPane() -> Data? {
+    var path = "/tmp/jetlink-pane.bin"
+    if let cfg = try? String(contentsOf: URL(fileURLWithPath: NSHomeDirectory() + "/.jetlink-pane-file"), encoding: .utf8) {
+      let named = cfg.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !named.isEmpty { path = named }
+    }
+    guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+          let modified = attrs[.modificationDate] as? Date,
+          Date().timeIntervalSince(modified) < 0.5,
+          let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+          data.count == Wire.paneBytes + 16 else { return nil }
+    return data.subdata(in: 16..<data.count)
   }
 
   /// A placeholder pane in the dashboard's shape: grey road, a heat blob that
