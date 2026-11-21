@@ -49,6 +49,13 @@ public enum LaneMask {
 
   /// The pinhole a model raster is: intrinsics folded with the fixed
   /// view-to-device rotation, so only (y, z, x) of a calib-frame point matter.
+  ///
+  /// `lane_lines` and `road_edges` arrive camera-relative with z down, so the
+  /// road sits at z ≈ +1.2 (measured on a drive: 1.20, 1.21, 1.18, 1.18, 1.29,
+  /// 1.57, 1.90, 2.17, 2.28 at x = 0, 3, 12, 27, 48, 75, 108, 147, 192 m).
+  /// `plan` is road-relative — its z is ≈ 0 on those same frames — which is why
+  /// openpilot's renderer offsets the path by the camera height and the lanes
+  /// by nothing (model_renderer._update_model). No offset belongs here.
   public struct Projection: Sendable, Equatable {
     public let width: Int
     public let height: Int

@@ -105,6 +105,23 @@ struct LaneMaskTests {
     #expect(LaneMask.Cell(rawValue: mask[0])! == .none)
   }
 
+  /// A lane line measured on a real drive, on the med raster: at 12 m the left
+  /// lane of a narrow road is (154, 137) — mid-left and just past half height,
+  /// which is where it sits in the image the model was fed. This is the test
+  /// that fails if the z convention (camera-relative, z down) is ever reversed.
+  @Test("A measured lane line lands where the model sees it")
+  func measured() {
+    let med = LaneMask.Projection.medmodel
+    let p = try! #require(med.pixel(x: 12, y: -1.34, z: 1.18))
+    #expect(abs(p.x - 154.38) < 0.01)
+    #expect(abs(p.y - 137.08) < 0.01)
+
+    // near-field samples fall out of the frame rather than folding back into it:
+    // at 3 m the same line is 150 px left of the raster and 405 px down
+    let near = try! #require(med.pixel(x: 3, y: -1.34, z: 1.21))
+    #expect(near.x < 0 && near.y > Double(med.height))
+  }
+
   /// The reply carries the polylines in its own layout, so they are read by
   /// slice name — and a layout without them yields no mask rather than a
   /// corrupted one.
