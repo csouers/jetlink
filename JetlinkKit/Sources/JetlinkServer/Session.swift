@@ -435,6 +435,35 @@ final class Session: @unchecked Sendable {
       )
     }
     host.frameStats.record(totalUs: reply.totalUs, gpuUs: reply.gpuUs, queueUs: reply.queueUs, sendUs: sendUs)
+    if let lanes = reply.lanes {
+      Session.renderLaneMask(lanes, spec: loaded.spec, frameID: reply.frameID)
+    }
+  }
+
+  /// The mask, drawn on its own queue: rasterizing a 512x256 raster costs a
+  /// fraction of a millisecond but not a fraction of a frame, and the reply is
+  /// the thing with a deadline. One in flight at a time — a mask superseded
+  /// while its predecessor is still drawing is a mask nobody was going to read.
+  private static let laneMaskQueue = DispatchQueue(label: "jetlink.lane-mask", qos: .utility)
+  private static let laneMaskLock = NSLock()
+  nonisolated(unsafe) private static var laneMaskBusy = false
+
+  private static func renderLaneMask(_ slices: LaneMask.Slices, spec: ModelSpec, frameID: UInt32) {
+    guard let projection = LaneMask.projection(for: spec), LaneMaskFile.due(frameID) else { return }
+    laneMaskLock.lock()
+    if laneMaskBusy {
+      laneMaskLock.unlock()
+      return
+    }
+    laneMaskBusy = true
+    laneMaskLock.unlock()
+    laneMaskQueue.async {
+      let mask = LaneMask.render(slices, projection: projection)
+      LaneMaskFile.write(mask, projection: projection, frameID: frameID)
+      Session.laneMaskLock.lock()
+      Session.laneMaskBusy = false
+      Session.laneMaskLock.unlock()
+    }
   }
 
   /// What an INFER_RESP says; the outputs are in `outputBuffer`.
@@ -455,6 +484,9 @@ final class Session: @unchecked Sendable {
     var failure: (any Error)?
     /// This frame asked for the pane, so one rides back with it.
     var wantPane = false
+    /// The frame's lane lines and road edges, copied out under the lock so the
+    /// mask can be drawn after the reply is gone (see LaneMask).
+    var lanes: LaneMask.Slices?
   }
 
   /// INFER_RESP: the head, the output buffer less hidden_state, and the
@@ -692,11 +724,14 @@ final class Session: @unchecked Sendable {
     }
 
     let replied = status == .ok || status == .notFinite
+    // Copied while the buffer is still this frame's: ~800 floats, so the render
+    // itself can wait until after the reply, off the frame's critical path
+    let lanes = replied ? LaneMask.slices(outputBuffer, count: count, spec: loaded.spec) : nil
     return InferReply(
       frameID: frameID, status: status, gpuUs: loaded.engine.lastGpuUs, queueUs: queueUs, totalUs: microseconds(since: started),
       outputCount: replied ? count : 0, hidden: replied && !flags.contains(.wantHidden) ? layout.hidden : nil,
       wantsState: flags.contains(.wantState), ran: true, failure: failure,
-      wantPane: flags.contains(.wantPane))
+      wantPane: flags.contains(.wantPane), lanes: lanes)
   }
 
   private func onShutdown(_ message: Message) throws {
