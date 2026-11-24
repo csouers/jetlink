@@ -64,6 +64,56 @@ Not yet measured: the Swift server over USB (the gate: p99 no worse, no frame
 dropped). To run it, plug the comma into the Mac with the app serving, and on
 the parked comma run `jetlink_repo/scripts/comma/jetlink_live_bench.sh 180`.
 
+## A 32 GB M1 Pro, macOS 15.7
+
+2026-11-14, a 32 GB M1 Pro MacBook Pro, macOS 15.7.7, the same ONNX Runtime
+1.29.0, the release `jetlink-server` built from this checkout, both the default
+split and GPU only. Two models: Light Speed 2 (`909a140019050a9d`, 769 MB, the
+newest in the index that day) and the same Cinque Terre V3.
+
+`jetlink-server bench --seconds 60`, 1,201 frames at 20 Hz, three runs each:
+
+| | Light Speed 2 | Cinque Terre V3 |
+| --- | ---: | ---: |
+| default split, mean / p50 / p99 | 34.3 / 34.3 / 38.3 ms | 30.6 / 30.4 / 32.8 ms |
+| GPU only (`--device coreml`), mean / p50 / p99 | 41.4 / 40.6 / 46.0 ms | 40.8 / 40.3 / 43.7 ms |
+| default split, frames over 50 ms | 1 | 0 |
+| GPU only, frames over 50 ms | 9 | 3 |
+
+`bench_link.py --rate 20 --n 1200` over TCP loopback, 393 KB up and 8 KB down a
+frame, default split:
+
+| | Light Speed 2 | Cinque Terre V3 |
+| --- | ---: | ---: |
+| round trip mean / p50 | 32.53 / 32.32 ms | 31.66 / 31.63 ms |
+| p90 / p99 / max | 33.65 / 35.99 / 53.26 ms | 32.49 / 33.62 / 35.22 ms |
+| jitter, p99 minus p50 | 3.68 ms | 1.99 ms |
+| server-side total | 32.05 ms | 31.17 ms |
+| frames over 50 ms | 1 of 1,190 | 0 of 1,190 |
+
+- V3 reproduces the 16 GB M1 Pro table above: 30.6 ms mean and a 32.8 ms p99,
+  against 30.6 and 33.8 to 34.8. A 32 GB machine on the older macOS is not
+  slower.
+- The newer, same-size Light Speed 2 is 3.7 ms slower than V3 and the jitterier
+  of the two. Its one miss is the cold first frame (64.6 ms); every later 10 s
+  window peaked at 43.9 ms or less.
+- GPU only settles at about 40.5 ms p50 on both models, 10 ms behind the default
+  split on V3, and never gets under 35 ms. Its runs here also carried sporadic
+  stalls (single frames of 180 to 2,900 ms, 3 to 38 frames over 50 ms in 1,200)
+  that the default split did not show; the p99 above is the cleanest of the three
+  runs for each model.
+- The GPU-only link was not measured over loopback.
+- The two tools count different things, so compare each table within itself: the
+  loopback mean sits about 2 ms below the bench mean.
+- Building this machine's engines took far longer than [Model
+  preparation](#model-preparation) reports elsewhere: 6 minutes for Light Speed 2
+  and 18 for V3 on the default split, and about 7.5 minutes each GPU only, most
+  of it parked in CoreML's `MLE5ProgramLibrary.lazyInitQueue` with only about 8 s
+  of CPU, then a second Neural Engine pass on the first load. Loads after that
+  took 4 s and 1 s. Watch that the process is progressing: its artifact grows,
+  then ANE weights appear under
+  `~/Library/Caches/jetlink-server/com.apple.e5rt.e5bundlecache`.
+
 ## How the default runs
 
 `--device ane`, the default:
